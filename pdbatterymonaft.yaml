@@ -1,0 +1,251 @@
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: DEBUG
+
+wifi:
+  networks:
+    - ssid: !secret pbphone_ssid
+      password: !secret pbphone_password
+    - ssid: !secret cmi_wifi_ssid
+      password: !secret cmi_wifi_password
+    - ssid: !secret pd_ssid
+      password: !secret pd_password
+    - ssid: !secret silva_ssid
+      password: !secret silva_password
+  fast_connect: false    # allow scanning for all networks
+  reboot_timeout: 15min  # Reboot the device if Wi-Fi fails to connect within 15 minutes
+  power_save_mode: none  # Optional: Optimize Wi-Fi performance for reconnection
+
+      
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Pdbatterymon Fallback Hotspot"
+    password: !secret device_wifi_password
+
+esphome:
+  name: "pdbatterymonaft"
+  friendly_name: "pdbatterymonaft"
+  platformio_options: 
+    board_build.flash_mode: dio
+  #    initial_value: !secret mqtt_broker
+  on_boot:
+    priority: -10     # Ensures this runs early in the boot sequence
+    then:
+      - lambda: |-
+          id(boot_time) = millis();  // Capture the boot time immediately after boot
+          id(reboot_count) += 1;
+          ESP_LOGD("reboot_counter", "Reboot count: %d", id(reboot_count));
+
+substitutions:
+  device_name: "pdbatterymonaft"
+  voltage_sample_interval: "100"   # ms
+  environment_interval: "15000"    # ms
+  mqtt_interval: "15000"
+  sliding_window_size: "10"
+  voltage_delta: "0.05"
+  ota_url_base: !secret ota_baseurl
+  vessel: "vessel/PoleDancer"
+
+globals:
+  - id: mqtt_broker
+    type: std::string
+    restore_value: no
+    initial_value: ""
+  - id: ota_url
+    type: std::string
+    restore_value: no
+    initial_value: ""
+    #initial_value: "https://foo.com/foo.bin"
+  - id: ota_urlmd5
+    type: std::string
+    restore_value: no
+    initial_value: ""
+    #initial_value: "https://foo.com/foo.md5"
+  - id: boot_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: reboot_count
+    type: int
+    restore_value: yes   # Ensures the value is saved between reboots
+    initial_value: '0'
+  - id: firmware_update_count
+    type: int
+    restore_value: yes   # Ensures the value is saved between reboots
+    initial_value: '0'
+
+# No API here ... it interferes with MQTT ... see https://esphome.io/components/mqtt.html
+
+
+http_request:
+  verify_ssl: false  # Set to true if your server has a valid SSL certificate
+
+ota:
+  - platform: http_request
+#    on_state_change:
+#      - logger.log: "OTA state change..."
+
+mqtt:
+  broker: !secret mqtt_broker
+  id: mqtt_client
+  port: 8883
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  discovery: false  # Disable Home Assistant discovery if not needed
+  topic_prefix: "${vessel}/${device_name}"  # base 
+  clean_session: true  # Ensure this is set to true
+#  skip_cert_cn_check: true
+#  idf_send_async: false
+
+  certificate_authority: !secret mqtt_ca_certificate
+  client_certificate: !secret mqtt_client_certificate
+  client_certificate_key: !secret mqtt_client_certificate_key
+
+  birth_message:
+    topic: "${device_name}/status"
+    payload: online
+  will_message:
+    topic: "${device_name}/status"
+    payload: offline
+  on_message:
+    topic: "esphome/device/ota"
+    qos: 0
+    then:
+      - logger.log: "Trying to flash from id(ota_url)"
+      - lambda: |-
+          id(firmware_update_count) += 1;
+      - ota.http_request.flash:
+          md5_url: !lambda 'return id(ota_urlmd5);'
+          url: !lambda 'return id(ota_url);'
+      - logger.log: "This message should not be displayed because the device reboots"
+  reboot_timeout: 15min  # Reboot the device if Wi-Fi fails to connect within 15 minutes
+  on_connect: 
+    then:
+      - logger.log: "MQTT connected..."
+
+
+captive_portal:
+
+# Define the pins used for I2C
+i2c:
+  sda: 6
+  scl: 7
+  scan: false
+
+# Automation to publish the sensor data to MQTT every 15 seconds
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // Check if ota_url is empty
+          if (id(ota_url).empty()) {
+            std::string mac_addr = id(wifi_mac_address).state;
+
+            // Remove all colons from the MAC address
+            mac_addr.erase(std::remove(mac_addr.begin(), mac_addr.end(), ':'), mac_addr.end());
+
+            id(ota_url) = std::string("${ota_url_base}") + std::string("${device_name}") + ".ota.bin";
+            id(ota_urlmd5) = std::string("${ota_url_base}") + std::string("${device_name}") + ".ota.md5";
+            ESP_LOGD("pdbatterymon_log", "OTA base url updated to: %s", id(ota_url).c_str());
+          }
+  - interval: 15s  # Publish to MQTT every 15 seconds
+    then:
+      - lambda: |-
+          ESP_LOGD("pdbatterymon_log", "Boot time: %d, boot count: %d, update count: %d", id(boot_time), id(reboot_count), id(firmware_update_count) );
+          ESP_LOGD("pdbatterymon_log", "Current OTA URL: %s", id(ota_url).c_str());
+          //ESP_LOGD("pdbatterymon_log", "INA3221 channel 1: state %s, val: %f", id(house_battery).has_state() ? "VALID" : "INVALID", id(house_battery).state );
+          //ESP_LOGD("pdbatterymon_log", "INA3221 channel 2: state %s, val: %f", id(starting_battery).has_state() ? "VALID" : "INVALID", id(starting_battery).state );
+          //ESP_LOGD("pdbatterymon_log", "INA3221 channel 3: state %s, val: %f", id(device_battery).has_state() ? "VALID" : "INVALID", id(device_battery).state );
+
+      - mqtt.publish:
+          topic: "${vessel}/battery/house"
+          payload: !lambda |-
+            if (id(house_battery).has_state()) {
+              ESP_LOGD("pdbatterymon_log", "INA3221 channel 1 state: %s, val: %f", id(house_battery).has_state() ? "VALID" : "INVALID", id(house_battery).state );
+              return( to_string(id(house_battery).state));
+            } else {
+              ESP_LOGD("pdbatterymon_log", "INA3221 channel 1 state: INVALID" );
+              return "0.000";  // Default value if INA3221 is not found
+            }
+      - mqtt.publish:
+          topic: "${vessel}/battery/starting"
+          payload: !lambda |-
+            if (id(starting_battery).has_state()) {
+              return( to_string(id(starting_battery).state));
+            } else {
+              return "0.000";  // Default value if INA3221 is not found
+            }
+      - mqtt.publish:
+          topic: "${vessel}/battery/devicepower"
+          payload: !lambda |-
+            if (id(device_battery).has_state()) {
+              return( to_string(id(device_battery).state));
+            } else {
+              return "0.000";  // Default value if INA3221 is not found
+            }
+
+sensor:
+  - platform: ina3221
+    update_interval: ${voltage_sample_interval}ms  # This updates the INA3221 readings at the specified interval
+    channel_1:
+      shunt_resistance: 0.1 ohm
+      bus_voltage:
+        id: house_battery
+        name: "House"
+        unit_of_measurement: "V"
+        filters:
+          - sliding_window_moving_average:
+              window_size: ${sliding_window_size}
+              send_every: 1
+          - delta: ${voltage_delta}
+
+    channel_2:
+      shunt_resistance: 0.1 ohm
+      bus_voltage:
+        id: starting_battery
+        name: "Starting"
+        unit_of_measurement: "V"
+        filters:
+          - sliding_window_moving_average:
+              window_size: ${sliding_window_size}
+              send_every: 1
+          - delta: ${voltage_delta}
+
+    channel_3:
+      shunt_resistance: 0.1 ohm
+      bus_voltage:
+        id: device_battery
+        name: "DevicePower"
+        unit_of_measurement: "V"
+        filters:
+          - sliding_window_moving_average:
+              window_size: ${sliding_window_size}
+              send_every: 1
+          - delta: ${voltage_delta}
+
+
+text_sensor:
+  - platform: wifi_info
+    mac_address:
+      id: wifi_mac_address
+      name: ESP Mac Wifi Address
+  - platform: template
+    id: firmware_url
+    name: "Firmware URL"
+  - platform: version
+    name: "ESPHome Version"
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Vancouver
+    servers:
+     - 0.pool.ntp.org
+     - 1.pool.ntp.org
+     - 2.pool.ntp.org
