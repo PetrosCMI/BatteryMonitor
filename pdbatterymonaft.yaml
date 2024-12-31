@@ -6,7 +6,7 @@ esp32:
 
 # Enable logging
 logger:
-  level: DEBUG
+  level: INFO
 
 wifi:
   networks:
@@ -40,7 +40,7 @@ esphome:
       - lambda: |-
           id(boot_time) = millis();  // Capture the boot time immediately after boot
           id(reboot_count) += 1;
-          ESP_LOGD("reboot_counter", "Reboot count: %d", id(reboot_count));
+          ESP_LOGI("reboot_counter", "Reboot count: %d", id(reboot_count));
 
 substitutions:
   device_name: "pdbatterymonaft"
@@ -50,7 +50,7 @@ substitutions:
   sliding_window_size: "10"
   voltage_delta: "0.05"
   ota_url_base: !secret ota_baseurl
-  vessel: "vessel/PoleDancer"
+  vessel_prefix: "vessel/PoleDancer"
 
 globals:
   - id: mqtt_broker
@@ -98,7 +98,7 @@ mqtt:
   username: !secret mqtt_user
   password: !secret mqtt_password
   discovery: false  # Disable Home Assistant discovery if not needed
-  topic_prefix: "${vessel}/${device_name}"  # base 
+  topic_prefix: "${vessel_prefix}/${device_name}"  # base 
   clean_session: true  # Ensure this is set to true
 #  skip_cert_cn_check: true
 #  idf_send_async: false
@@ -108,10 +108,10 @@ mqtt:
   client_certificate_key: !secret mqtt_client_certificate_key
 
   birth_message:
-    topic: "${device_name}/status"
+    topic: "${vessel_prefix}/${device_name}/status"
     payload: online
   will_message:
-    topic: "${device_name}/status"
+    topic: "${vessel_prefix}/${device_name}/status"
     payload: offline
   on_message:
     topic: "esphome/device/ota"
@@ -157,14 +157,14 @@ interval:
   - interval: 15s  # Publish to MQTT every 15 seconds
     then:
       - lambda: |-
-          ESP_LOGD("pdbatterymon_log", "Boot time: %d, boot count: %d, update count: %d", id(boot_time), id(reboot_count), id(firmware_update_count) );
-          ESP_LOGD("pdbatterymon_log", "Current OTA URL: %s", id(ota_url).c_str());
+          ESP_LOGI("pdbatterymon_log", "Boot time: %d, boot count: %d, update count: %d", id(boot_time), id(reboot_count), id(firmware_update_count) );
+          ESP_LOGI("pdbatterymon_log", "Current OTA URL: %s", id(ota_url).c_str());
           //ESP_LOGD("pdbatterymon_log", "INA3221 channel 1: state %s, val: %f", id(house_battery).has_state() ? "VALID" : "INVALID", id(house_battery).state );
           //ESP_LOGD("pdbatterymon_log", "INA3221 channel 2: state %s, val: %f", id(starting_battery).has_state() ? "VALID" : "INVALID", id(starting_battery).state );
           //ESP_LOGD("pdbatterymon_log", "INA3221 channel 3: state %s, val: %f", id(device_battery).has_state() ? "VALID" : "INVALID", id(device_battery).state );
 
       - mqtt.publish:
-          topic: "${vessel}/battery/house"
+          topic: "${vessel_prefix}/battery/house"
           payload: !lambda |-
             if (id(house_battery).has_state()) {
               ESP_LOGD("pdbatterymon_log", "INA3221 channel 1 state: %s, val: %f", id(house_battery).has_state() ? "VALID" : "INVALID", id(house_battery).state );
@@ -174,7 +174,7 @@ interval:
               return "0.000";  // Default value if INA3221 is not found
             }
       - mqtt.publish:
-          topic: "${vessel}/battery/starting"
+          topic: "${vessel_prefix}/battery/starting"
           payload: !lambda |-
             if (id(starting_battery).has_state()) {
               return( to_string(id(starting_battery).state));
@@ -182,7 +182,7 @@ interval:
               return "0.000";  // Default value if INA3221 is not found
             }
       - mqtt.publish:
-          topic: "${vessel}/battery/devicepower"
+          topic: "${vessel_prefix}/battery/devicepower"
           payload: !lambda |-
             if (id(device_battery).has_state()) {
               return( to_string(id(device_battery).state));
@@ -197,20 +197,24 @@ sensor:
       shunt_resistance: 0.1 ohm
       bus_voltage:
         id: house_battery
+        internal: true  # This makes the sensor internal, no data is auto-published
         name: "House"
         unit_of_measurement: "V"
+        accuracy_decimals: 2
         filters:
           - sliding_window_moving_average:
               window_size: ${sliding_window_size}
               send_every: 1
-          - delta: ${voltage_delta}
+          #- delta: ${voltage_delta}
 
     channel_2:
       shunt_resistance: 0.1 ohm
       bus_voltage:
         id: starting_battery
+        internal: true  # This makes the sensor internal, no data is auto-published
         name: "Starting"
         unit_of_measurement: "V"
+        accuracy_decimals: 2
         filters:
           - sliding_window_moving_average:
               window_size: ${sliding_window_size}
@@ -221,8 +225,10 @@ sensor:
       shunt_resistance: 0.1 ohm
       bus_voltage:
         id: device_battery
+        internal: true  # This makes the sensor internal, no data is auto-published
         name: "DevicePower"
         unit_of_measurement: "V"
+        accuracy_decimals: 2
         filters:
           - sliding_window_moving_average:
               window_size: ${sliding_window_size}
