@@ -1,0 +1,432 @@
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: INFO
+
+wifi: 
+  networks:
+    - ssid: !secret pbphone_ssid
+      password: !secret pbphone_password
+    - ssid: !secret cmi_wifi_ssid
+      password: !secret cmi_wifi_password
+    - ssid: !secret pd_ssid
+      password: !secret pd_password
+    - ssid: !secret silva_ssid
+      password: !secret silva_password
+  fast_connect: false    # allow scanning for all networks
+  reboot_timeout: 15min  # Reboot the device if Wi-Fi fails to connect within 15 minutes
+  power_save_mode: none  # Optional: Optimize Wi-Fi performance for reconnection
+
+
+      
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Pdbatterymon Fallback Hotspot"
+    password: !secret device_wifi_password
+
+esphome:
+  name: "pdbatterymonfwd"
+  friendly_name: "pdbatterymonfwd"
+  platformio_options: 
+    board_build.flash_mode: dio
+    #board_build.flash_size: 2MB     # XIAO ESP32C3 should have 4MB
+  #    initial_value: !secret mqtt_broker
+  on_boot:
+    priority: -10     # Ensures this runs early in the boot sequence
+    then:
+      - lambda: |-
+          id(boot_time) = millis();  // Capture the boot time immediately after boot
+          id(reboot_count) += 1;
+          ESP_LOGI("reboot_counter", "Reboot count: %d", id(reboot_count));
+
+substitutions:
+  device_name: "pdbatterymonfwd"
+  voltage_sample_interval: "100"   # ms
+  environment_interval: "15000"    # ms
+  mqtt_interval: "15000"
+  sliding_window_size: "10"
+  voltage_delta: "0.01"
+  ota_url_base: !secret ota_baseurl
+  vessel_prefix: "vessel/PoleDancer"
+
+globals:
+  - id: mqtt_broker
+    type: std::string
+    restore_value: no
+    initial_value: ""
+  - id: ota_url
+    type: std::string
+    restore_value: no
+    initial_value: ""
+    #initial_value: "https://foo.com/foo.bin"
+  - id: ota_urlmd5
+    type: std::string
+    restore_value: no
+    initial_value: ""
+    #initial_value: "https://foo.com/foo.md5"
+  - id: boot_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: reboot_count
+    type: int
+    restore_value: yes   # Ensures the value is saved between reboots
+    initial_value: '0'
+  - id: firmware_update_count
+    type: int
+    restore_value: yes   # Ensures the value is saved between reboots
+    initial_value: '0'
+
+# No API here ... it interferes with MQTT ... see https://esphome.io/components/mqtt.html
+
+
+http_request:
+  verify_ssl: false  # Set to true if your server has a valid SSL certificate
+
+ota:
+  - platform: http_request
+#    on_state_change:
+#      - logger.log: "OTA state change..."
+
+mqtt:
+  broker: !secret mqtt_broker
+  id: mqtt_client
+  port: 8883
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  discovery: false  # Disable Home Assistant discovery if not needed
+  topic_prefix: "vessel/PoleDancer/${device_name}"  # base 
+  clean_session: true  # Ensure this is set to true
+#  skip_cert_cn_check: true
+#  idf_send_async: false
+
+  certificate_authority: !secret mqtt_ca_certificate
+  client_certificate: !secret mqtt_client_certificate
+  client_certificate_key: !secret mqtt_client_certificate_key
+
+  birth_message:
+    topic: "${device_name}/status"
+    payload: online
+  will_message:
+    topic: "${device_name}/status"
+    payload: offline
+  on_message:
+    topic: "esphome/device/ota"
+    qos: 0
+    then:
+      - logger.log: "Trying to flash from id(ota_url)"
+      - lambda: |-
+          id(firmware_update_count) += 1;
+      - ota.http_request.flash:
+          md5_url: !lambda 'return id(ota_urlmd5);'
+          url: !lambda 'return id(ota_url);'
+      - logger.log: "This message should not be displayed because the device reboots"
+  reboot_timeout: 15min  # Reboot the device if Wi-Fi fails to connect within 15 minutes
+  on_connect: 
+    then:
+      - logger.log: "MQTT connected..."
+
+
+captive_portal:
+
+# Define the pins used for I2C
+i2c:
+  sda: 6
+  scl: 7
+  scan: true
+
+# Automation to publish the specific data to MQTT every 15 seconds
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          // Check if ota_url is empty
+          if (id(ota_url).empty()) {
+            std::string mac_addr = id(wifi_mac_address).state;
+
+            // Remove all colons from the MAC address
+            mac_addr.erase(std::remove(mac_addr.begin(), mac_addr.end(), ':'), mac_addr.end());
+
+            id(ota_url) = std::string("${ota_url_base}") + std::string("${device_name}") + ".ota.bin";
+            id(ota_urlmd5) = std::string("${ota_url_base}") + std::string("${device_name}") + ".ota.md5";
+            ESP_LOGD("pdbatterymon_log", "OTA base url updated to: %s", id(ota_url).c_str());
+          }
+  - interval: 15s  # Publish to MQTT every 15 seconds
+    then:
+      - lambda: |-
+          ESP_LOGI("pdbatterymon_log", "Boot time: %d, boot count: %d, update count: %d", id(boot_time), id(reboot_count), id(firmware_update_count) );
+          ESP_LOGI("pdbatterymon_log", "Current OTA URL: %s", id(ota_url).c_str());
+          ESP_LOGD("pdbatterymon_log", "INA226: state %s, val: %f", id(forward_battery).has_state() ? "VALID" : "INVALID", id(forward_battery).state );
+
+      - mqtt.publish:
+          topic: "${vessel_prefix}/battery/forward"
+          payload: !lambda |-
+            if (id(forward_battery).has_state()) {
+              ESP_LOGD("pdbatterymon_log", "INA3221 channel 1 state: %s, val: %f", id(forward_battery).has_state() ? "VALID" : "INVALID", id(forward_battery).state );
+              return( to_string(id(forward_battery).state));
+            } else {
+              ESP_LOGW("pdbatterymon_log", "INA3221 channel 1 state: INVALID" );
+              return "0.000";  // Default value if INA3221 is not found
+            }
+
+      - mqtt.publish:
+          topic: "${vessel_prefix}/environment/temperature"
+          payload: !lambda |-
+            return( to_string(id(bme280_temperature).state));
+
+      - mqtt.publish:
+          topic: "${vessel_prefix}/environment/humidity"
+          payload: !lambda |-
+            return( to_string(id(bme280_humidity).state));
+
+      - mqtt.publish:
+          topic: "${vessel_prefix}/environment/pressure"
+          payload: !lambda |-
+            return( to_string(id(bme280_pressure).state));
+
+      - mqtt.publish:
+          topic: "${vessel_prefix}/environment/dewpoint"
+          payload: !lambda |-
+            return( to_string(id(bme280_dewpoint).state));
+
+
+
+sensor:
+  - platform: ina226
+    shunt_resistance: 0.1 ohm
+    adc_time: 140us
+    adc_averaging: 128
+    update_interval: 1s
+    bus_voltage:
+      name: "Forward Battery"
+      id: forward_battery
+      internal: true  # This makes the sensor internal, no data is auto-published
+      unit_of_measurement: "V"
+      accuracy_decimals: 2
+      filters:
+        - sliding_window_moving_average:
+            window_size: ${sliding_window_size}
+            send_every: 1
+        - delta: ${voltage_delta}
+
+  - platform: bme280_i2c
+    address: 0x76
+    update_interval: 60s       # MUST BE 1min intervals for DELTA calcs
+
+    temperature:
+      name: "BME280 Temperature"
+      id: bme280_temperature
+      internal: true  # This makes the sensor internal, no data is auto-published
+      accuracy_decimals: 1
+      oversampling: 16x
+
+    humidity:
+      name: "BME280 Humidity"
+      id: bme280_humidity
+      internal: true  # This makes the sensor internal, no data is auto-published
+      accuracy_decimals: 1
+      oversampling: 16x
+
+    pressure:
+      name: "BME280 Pressure"
+      id: bme280_pressure
+      internal: true  # This makes the sensor internal, no data is auto-published
+      unit_of_measurement: "hPa"
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: ${sliding_window_size}  # Average over 10 readings
+            send_every: 1    # Send every reading    
+
+  - platform: template
+    name: "BME280 DewPoint"
+    id: bme280_dewpoint
+    internal: true  # This makes the sensor internal, no data is auto-published
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    lambda: |-
+      const float a = 17.27;
+      const float b = 237.7;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      float alpha = (a * T) / (b + T) + log(RH / 100.0);
+      return (b * alpha) / (a - alpha);
+
+  - platform: template
+    name: "Pressure Change (1 Hour)"
+    id: pressure_change_1hr
+    unit_of_measurement: "hPa/h"
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: |-
+      const int NUM_READINGS_1HR = 60;
+      static float readings[NUM_READINGS_1HR] = {0};
+      static int index = 0;
+      static bool filled = false;
+      static bool inited = false;
+
+      float current_pressure = id(bme280_pressure).state;
+
+      if( ! inited ) {
+        for( int i = 0 ; i < NUM_READINGS_1HR ; i++ ) {
+          readings[i] = current_pressure;
+        }
+        inited = true;
+      }
+
+      float pressure_1hr_ago = readings[index];
+      readings[index] = current_pressure;
+      index = (index + 1) % NUM_READINGS_1HR;
+
+
+      if (index == 0) {
+        filled = true;
+      }
+
+      if (!filled) {
+        return 0.0;  // Not enough data yet
+      }
+
+      return current_pressure - pressure_1hr_ago;
+
+  - platform: template
+    name: "Pressure Change (3 Hours)"
+    id: pressure_change_3hr
+    unit_of_measurement: "hPa/3h"
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: |-
+      const int NUM_READINGS_3HR = 180;
+      static float readings[NUM_READINGS_3HR] = {0};
+      static int index = 0;
+      static bool filled = false;
+      static bool inited = false;
+
+      float current_pressure = id(bme280_pressure).state;
+
+      if( ! inited ) {
+        for( int i = 0 ; i < NUM_READINGS_3HR ; i++ ) {
+          readings[i] = current_pressure;
+        }
+        inited = true;
+      }
+
+      float pressure_3hr_ago = readings[index];
+      readings[index] = current_pressure;
+      index = (index + 1) % NUM_READINGS_3HR;
+
+      if (index == 0) {
+        filled = true;
+      }
+
+      if (!filled) {
+        return 0.0;  // Not enough data yet
+      }
+
+      return current_pressure - pressure_3hr_ago;
+
+  - platform: template
+    name: "Pressure Change (24 Hours)"
+    id: pressure_change_24hr
+    unit_of_measurement: "hPa/24h"
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: |-
+      const int NUM_READINGS_24HR = 1440;
+      static float readings[NUM_READINGS_24HR] = {0};
+      static int index = 0;
+      static bool filled = false;
+      static bool inited = false;
+
+      float current_pressure = id(bme280_pressure).state;
+
+      if( ! inited ) {
+        for( int i = 0 ; i < NUM_READINGS_24HR ; i++ ) {
+          readings[i] = current_pressure;
+        }
+        inited = true;
+      }
+
+      float pressure_24hr_ago = readings[index];
+      readings[index] = current_pressure;
+      index = (index + 1) % NUM_READINGS_24HR;
+
+      if (index == 0) {
+        filled = true;
+      }
+
+      if (!filled) {
+        return 0.0;  // Not enough data yet
+      }
+
+      return current_pressure - pressure_24hr_ago;
+
+binary_sensor:
+  - platform: template
+    name: "Storm Alert"
+    id: storm_alert
+    lambda: |-
+      float change_1hr = id(pressure_change_1hr).state;
+      float change_3hr = id(pressure_change_3hr).state;
+
+      // Alert conditions:
+      // - Pressure drops > -2.0 hPa in 1 hour (rapid drop)
+      // - Pressure drops > -5.0 hPa in 3 hours (sustained drop)
+      if (change_1hr <= -2.0 || change_3hr <= -5.0) {
+        return true;  // Storm likely
+      } else {
+        return false;  // No storm
+      }
+    device_class: safety
+
+text_sensor:
+  - platform: wifi_info
+    mac_address:
+      id: wifi_mac_address
+      name: ESP Mac Wifi Address
+  - platform: template
+    id: firmware_url
+    name: "Firmware URL"
+  - platform: template
+    id: firmware_urlmd5
+    name: "Firmware URL MD5"
+
+  - platform: version
+    name: "ESPHome Version"
+
+  - platform: template
+    name: "Update URL"
+    id: update_url
+
+  - platform: template
+    name: "Storm Alert Level"
+    id: storm_alert_level
+    update_interval: ${environment_interval}ms
+    lambda: |-
+      float change_1hr = id(pressure_change_1hr).state;
+      float change_3hr = id(pressure_change_3hr).state;
+
+      // Alert Conditions:
+      if (change_1hr < -2.0 || change_3hr < -5.0) {
+        return {"Extreme Alert"};  // Severe weather system likely
+      } else if (change_1hr < -1.5 || change_3hr < -3.0) {
+        return {"Strong Alert"};   // Strong storm approaching
+      } else if (change_1hr < -0.5 || change_3hr < -1.5) {
+        return {"Mild Alert"};     // Possible storm forming
+      } else {
+        return {"No Alert"};       // Normal conditions
+      }
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Vancouver
+    servers:
+     - 0.pool.ntp.org
+     - 1.pool.ntp.org
+     - 2.pool.ntp.org
