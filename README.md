@@ -11,3 +11,9 @@ ESPHome device configuration to:
  - Monitor Temperature, humidity and pressure using BME280
  - Send data over secure connection to remote MQTT broker
  - OTA updates using HTTPS request when device receives specific MQTT message
+
+Server Side Requirements
+ - MQTT Broker
+ - Web Server that serves up firmware updates.  The updates are the OTA format and an MD5 file
+
+   
